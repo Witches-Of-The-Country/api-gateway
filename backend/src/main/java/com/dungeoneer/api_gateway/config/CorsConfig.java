@@ -19,7 +19,7 @@ public class CorsConfig {
     public CorsFilter corsFilter(
             @Value("${cors.allowed-origins:http://localhost:3000}") String allowedOrigins,
             @Value("${cors.allowed-methods:GET,POST,PUT,DELETE,PATCH,OPTIONS}") String allowedMethods,
-            @Value("${cors.allowed-headers:Authorization,Content-Type,X-User-Id}") String allowedHeaders,
+            @Value("${cors.allowed-headers:Authorization,Content-Type,X-User-Id,Accept,Origin}") String allowedHeaders,
             @Value("${cors.allow-credentials:true}") boolean allowCredentials) {
 
         CorsConfiguration config = new CorsConfiguration();
