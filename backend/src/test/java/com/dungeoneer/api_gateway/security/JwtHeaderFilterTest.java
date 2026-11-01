@@ -34,7 +34,7 @@ class JwtHeaderFilterTest {
 
     @BeforeEach
     void setUp() {
-        filter = new JwtHeaderFilter(TEST_SECRET);
+        filter = new JwtHeaderFilter(TEST_SECRET, "http://localhost:3000,http://127.0.0.1:3000");
     }
 
     private String generateToken(UUID userId, Date expiration, String secret) throws Exception {
