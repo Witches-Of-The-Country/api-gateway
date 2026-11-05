@@ -5,6 +5,7 @@ import com.nimbusds.jose.crypto.MACVerifier;
 import com.nimbusds.jwt.SignedJWT;
 import jakarta.servlet.FilterChain;
 import jakarta.servlet.ServletException;
+import jakarta.servlet.http.Cookie;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletRequestWrapper;
 import jakarta.servlet.http.HttpServletResponse;
@@ -22,17 +23,24 @@ import java.util.*;
 @Order(Ordered.HIGHEST_PRECEDENCE + 10)
 public class JwtHeaderFilter extends OncePerRequestFilter {
 
+    public static final String AUTH_COOKIE_NAME = "dungeoneer_auth_token";
+    public static final String LEGACY_AUTH_COOKIE_NAME = "dungeoneer_token";
+
     private static final String HEADER_X_USER_ID = "X-User-Id";
     private static final String HEADER_X_USER_ROLES = "X-User-Roles";
+    private static final String HEADER_X_INTERNAL_SECRET = "X-Internal-Secret";
     private static final String HEADER_AUTHORIZATION = "Authorization";
     private static final String BEARER_PREFIX = "Bearer ";
 
     private final byte[] secretKeyBytes;
     private final Set<String> allowedOrigins;
+    private final String internalGatewaySecret;
 
+    @org.springframework.beans.factory.annotation.Autowired
     public JwtHeaderFilter(
             @Value("${jwt.secret}") String jwtSecret,
-            @Value("${cors.allowed-origins:http://localhost:3000,http://127.0.0.1:3000}") String allowedOriginsConfig) {
+            @Value("${cors.allowed-origins:http://localhost:3000,http://127.0.0.1:3000}") String allowedOriginsConfig,
+            @Value("${internal.gateway.secret:${INTERNAL_GATEWAY_SECRET:}}") String internalGatewaySecret) {
         Objects.requireNonNull(jwtSecret, "jwt.secret must not be null");
         this.secretKeyBytes = jwtSecret.getBytes(StandardCharsets.UTF_8);
         if (this.secretKeyBytes.length < 32) {
@@ -47,6 +55,11 @@ public class JwtHeaderFilter extends OncePerRequestFilter {
                     .forEach(origins::add);
         }
         this.allowedOrigins = Collections.unmodifiableSet(origins);
+        this.internalGatewaySecret = internalGatewaySecret != null ? internalGatewaySecret.trim() : "";
+    }
+
+    public JwtHeaderFilter(String jwtSecret, String allowedOriginsConfig) {
+        this(jwtSecret, allowedOriginsConfig, "");
     }
 
     @Override
@@ -55,8 +68,11 @@ public class JwtHeaderFilter extends OncePerRequestFilter {
             HttpServletResponse response,
             FilterChain filterChain) throws ServletException, IOException {
 
+        applySecurityHeaders(response);
+
         // Allow preflight OPTIONS requests to proceed directly for CORS handling
         if ("OPTIONS".equalsIgnoreCase(request.getMethod())) {
+            applyCorsHeaders(request, response);
             filterChain.doFilter(request, response);
             return;
         }
@@ -72,22 +88,18 @@ public class JwtHeaderFilter extends OncePerRequestFilter {
         UUID verifiedUserId = null;
         List<String> verifiedRoles = null;
 
-        String authHeader = request.getHeader(HEADER_AUTHORIZATION);
-        boolean hasBearerToken = authHeader != null && authHeader.regionMatches(true, 0, BEARER_PREFIX, 0, BEARER_PREFIX.length());
+        String rawToken = extractToken(request);
+        boolean hasToken = rawToken != null && !rawToken.isBlank();
 
-        if (isProtected || hasBearerToken) {
-            if (isProtected && !hasBearerToken) {
+        if (isProtected || hasToken) {
+            if (isProtected && !hasToken) {
                 sendUnauthorized(request, response, path, "Missing or invalid Authorization header");
                 return;
             }
 
-            if (hasBearerToken) {
-                String token = authHeader.substring(BEARER_PREFIX.length()).trim();
-                while (token.regionMatches(true, 0, BEARER_PREFIX, 0, BEARER_PREFIX.length())) {
-                    token = token.substring(BEARER_PREFIX.length()).trim();
-                }
+            if (hasToken) {
                 try {
-                    SignedJWT signedJWT = SignedJWT.parse(token);
+                    SignedJWT signedJWT = SignedJWT.parse(rawToken);
                     JWSVerifier verifier = new MACVerifier(this.secretKeyBytes);
 
                     if (!signedJWT.verify(verifier)) {
@@ -140,8 +152,40 @@ public class JwtHeaderFilter extends OncePerRequestFilter {
         }
 
         // Unconditionally strip client-supplied X-User-Id / X-User-Roles and only inject verified perimeter headers
-        HeaderModifyingRequestWrapper wrappedRequest = new HeaderModifyingRequestWrapper(request, verifiedUserId, verifiedRoles);
+        HeaderModifyingRequestWrapper wrappedRequest = new HeaderModifyingRequestWrapper(request, verifiedUserId, verifiedRoles, this.internalGatewaySecret);
         filterChain.doFilter(wrappedRequest, response);
+    }
+
+    private void applySecurityHeaders(HttpServletResponse response) {
+        response.setHeader("X-Content-Type-Options", "nosniff");
+        response.setHeader("X-Frame-Options", "DENY");
+        response.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
+    }
+
+    private String extractToken(HttpServletRequest request) {
+        String authHeader = request.getHeader(HEADER_AUTHORIZATION);
+        if (authHeader != null && authHeader.regionMatches(true, 0, BEARER_PREFIX, 0, BEARER_PREFIX.length())) {
+            String token = authHeader.substring(BEARER_PREFIX.length()).trim();
+            while (token.regionMatches(true, 0, BEARER_PREFIX, 0, BEARER_PREFIX.length())) {
+                token = token.substring(BEARER_PREFIX.length()).trim();
+            }
+            if (!token.isBlank()) {
+                return token;
+            }
+        }
+
+        Cookie[] cookies = request.getCookies();
+        if (cookies != null) {
+            for (Cookie cookie : cookies) {
+                if (AUTH_COOKIE_NAME.equals(cookie.getName()) || LEGACY_AUTH_COOKIE_NAME.equals(cookie.getName())) {
+                    if (cookie.getValue() != null && !cookie.getValue().isBlank()) {
+                        return cookie.getValue().trim();
+                    }
+                }
+            }
+        }
+
+        return null;
     }
 
     private boolean isCharacterRoute(String path) {
@@ -149,7 +193,16 @@ public class JwtHeaderFilter extends OncePerRequestFilter {
     }
 
     private boolean isAuthProtectedRoute(String path) {
-        return path != null && path.startsWith("/api/auth/me");
+        if (path == null) {
+            return false;
+        }
+        if (path.startsWith("/api/auth/login") ||
+                path.startsWith("/api/auth/register") ||
+                path.startsWith("/api/auth/public-key") ||
+                path.startsWith("/api/auth/logout")) {
+            return false;
+        }
+        return path.startsWith("/api/auth/");
     }
 
     private boolean isReferenceMutationRoute(String path, String method) {
@@ -178,8 +231,8 @@ public class JwtHeaderFilter extends OncePerRequestFilter {
 
         String json = String.format(
                 "{\"type\":\"about:blank\",\"title\":\"Unauthorized\",\"status\":401,\"detail\":\"%s\",\"instance\":\"%s\"}",
-                escapeJson(detail),
-                escapeJson(instance)
+                detail,
+                instance != null ? instance : "/api"
         );
         response.getWriter().write(json);
     }
@@ -192,35 +245,31 @@ public class JwtHeaderFilter extends OncePerRequestFilter {
 
         String json = String.format(
                 "{\"type\":\"about:blank\",\"title\":\"Forbidden\",\"status\":403,\"detail\":\"%s\",\"instance\":\"%s\"}",
-                escapeJson(detail),
-                escapeJson(instance)
+                detail,
+                instance != null ? instance : "/api"
         );
         response.getWriter().write(json);
     }
 
-    private String escapeJson(String input) {
-        if (input == null) {
-            return "";
-        }
-        return input.replace("\\", "\\\\").replace("\"", "\\\"");
-    }
-
     /**
-     * Request wrapper that filters out untrusted headers and injects verified perimeter headers.
+     * Request wrapper that strips client-supplied X-User-Id and X-User-Roles,
+     * and only injects perimeter-verified values.
      */
     static class HeaderModifyingRequestWrapper extends HttpServletRequestWrapper {
 
         private final Map<String, List<String>> headers = new TreeMap<>(String.CASE_INSENSITIVE_ORDER);
 
-        HeaderModifyingRequestWrapper(HttpServletRequest request, UUID verifiedUserId, List<String> verifiedRoles) {
+        HeaderModifyingRequestWrapper(HttpServletRequest request, UUID verifiedUserId, List<String> verifiedRoles, String internalGatewaySecret) {
             super(request);
 
             Enumeration<String> headerNames = request.getHeaderNames();
             if (headerNames != null) {
                 while (headerNames.hasMoreElements()) {
                     String name = headerNames.nextElement();
-                    // Strip incoming X-User-Id and X-User-Roles
-                    if (!HEADER_X_USER_ID.equalsIgnoreCase(name) && !HEADER_X_USER_ROLES.equalsIgnoreCase(name)) {
+                    // Strip incoming X-User-Id, X-User-Roles, and client-forged X-Internal-Secret
+                    if (!HEADER_X_USER_ID.equalsIgnoreCase(name)
+                            && !HEADER_X_USER_ROLES.equalsIgnoreCase(name)
+                            && !HEADER_X_INTERNAL_SECRET.equalsIgnoreCase(name)) {
                         List<String> values = Collections.list(request.getHeaders(name));
                         this.headers.put(name, values);
                     }
@@ -236,6 +285,15 @@ public class JwtHeaderFilter extends OncePerRequestFilter {
             if (verifiedRoles != null && !verifiedRoles.isEmpty()) {
                 this.headers.put(HEADER_X_USER_ROLES, List.of(String.join(",", verifiedRoles)));
             }
+
+            // Inject verified perimeter secret if configured
+            if (internalGatewaySecret != null && !internalGatewaySecret.isBlank()) {
+                this.headers.put(HEADER_X_INTERNAL_SECRET, List.of(internalGatewaySecret));
+            }
+        }
+
+        HeaderModifyingRequestWrapper(HttpServletRequest request, UUID verifiedUserId, List<String> verifiedRoles) {
+            this(request, verifiedUserId, verifiedRoles, "");
         }
 
         @Override

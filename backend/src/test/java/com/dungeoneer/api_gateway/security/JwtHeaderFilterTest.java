@@ -175,4 +175,29 @@ class JwtHeaderFilterTest {
         assertThat(forwardedRequest.get()).isNotNull();
         assertThat(forwardedRequest.get().getHeader("X-User-Id")).isNull();
     }
+
+    @Test
+    @DisplayName("SEC-CRIT-02: Injects perimeter X-Internal-Secret and strips client-forged secret")
+    void injectsInternalSecretAndStripsClientForgedSecret() throws Exception {
+        String internalSecret = "gateway-secret-perimeter-2026";
+        JwtHeaderFilter filterWithSecret = new JwtHeaderFilter(
+                TEST_SECRET,
+                "http://localhost:3000",
+                internalSecret
+        );
+
+        MockHttpServletRequest request = new MockHttpServletRequest("GET", "/api/reference/classes");
+        request.addHeader("X-Internal-Secret", "client-forged-secret");
+
+        MockHttpServletResponse response = new MockHttpServletResponse();
+        AtomicReference<HttpServletRequest> forwardedRequest = new AtomicReference<>();
+        FilterChain chain = (req, res) -> forwardedRequest.set((HttpServletRequest) req);
+
+        filterWithSecret.doFilter(request, response, chain);
+
+        assertThat(response.getStatus()).isEqualTo(200);
+        assertThat(forwardedRequest.get()).isNotNull();
+        assertThat(forwardedRequest.get().getHeader("X-Internal-Secret")).isEqualTo(internalSecret);
+        assertThat(forwardedRequest.get().getHeader("X-Internal-Secret")).isNotEqualTo("client-forged-secret");
+    }
 }
